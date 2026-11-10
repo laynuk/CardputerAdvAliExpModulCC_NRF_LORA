@@ -1,6 +1,9 @@
 #include "nrf_common.h"
 #include "../../core/bus_HAL.h"
 #include "../../core/mykeyboard.h"
+#ifdef CARDPUTER_ADV_3IN1
+#include <Wire.h>
+#endif
 
 RF24 NRFradio(bruceConfigPins.NRF24_bus.io0, bruceConfigPins.NRF24_bus.cs);
 HardwareSerial NRFSerial = HardwareSerial(2); // Uses UART2 for External NRF's
@@ -43,6 +46,16 @@ bool nrf_start(NRF24_MODE mode) {
 
     if (!CHECK_NRF_SPI(mode)) return result;
 
+#ifdef CARDPUTER_ADV_3IN1
+    // Cardputer ADV 3-in-1: CE/CSN are the keyboard I2C lines (G8/G9). Take them over from
+    // Wire1; the keyboard handler borrows them back for each key event (interface.cpp).
+    Wire1.end();
+    // Make sure the other modules on the shared SPI bus are deselected
+    pinMode(bruceConfigPins.CC1101_bus.cs, OUTPUT);
+    digitalWrite(bruceConfigPins.CC1101_bus.cs, HIGH);
+    pinMode(bruceConfigPins.LoRa_bus.cs, OUTPUT);
+    digitalWrite(bruceConfigPins.LoRa_bus.cs, HIGH);
+#endif
     // Always re-assert CE LOW and CS HIGH before begin() — these pins
     // may have been left in an indeterminate state by the previous session,
     // especially after stopConstCarrier() which can leave CE HIGH internally.

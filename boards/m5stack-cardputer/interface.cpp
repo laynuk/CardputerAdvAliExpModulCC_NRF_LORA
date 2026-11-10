@@ -22,6 +22,56 @@ constexpr unsigned long TCA8418_REPEAT_MS = 150;
 int handleSpecialKeys(uint8_t row, uint8_t col, bool pressed);
 void mapRawKeyToPhysical(uint8_t rawValue, uint8_t &row, uint8_t &col);
 
+#ifdef CARDPUTER_ADV_3IN1
+/***************************************************************************************
+** 3-in-1 module: NRF24 CE = G8 (keyboard SDA), CSN = G9 (keyboard SCL).
+**
+** While the keyboard owns G8/G9 they are I2C (Wire1). nrf_start() takes them over as
+** plain GPIO (Wire1.end() + pinMode). From then on, every access to the keyboard or the
+** ES8311 codec "borrows" the lines back:
+**   1. lock the NRF SPI bus, so RF24 can't be in the middle of a transfer (CSN is HIGH),
+**   2. remember the CE level, start Wire1, talk to the I2C device,
+**   3. stop Wire1, put CSN back HIGH and CE back to its previous level, unlock SPI.
+** Nothing happens (zero overhead) while the keyboard still owns the pins.
+***************************************************************************************/
+#include <SPI.h>
+#include <esp32-hal-periman.h>
+#include <soc/gpio_reg.h>
+extern SPIClass *NRFSPI; // modules/NRF24/nrf_common.cpp
+
+static inline bool advI2cPinsTakenByNrf() {
+    return perimanGetPinBusType((uint8_t)TCA8418_SCL_PIN) != ESP32_BUS_TYPE_I2C_MASTER_SCL;
+}
+
+class AdvI2cBorrow {
+public:
+    AdvI2cBorrow() {
+        if (!advI2cPinsTakenByNrf()) return;
+        borrowed = true;
+        if (NRFSPI != nullptr) {
+            NRFSPI->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+            spiLocked = true;
+        }
+        ceLevel = (REG_READ(GPIO_OUT_REG) >> TCA8418_SDA_PIN) & 0x01;
+        Wire1.begin(TCA8418_SDA_PIN, TCA8418_SCL_PIN);
+    }
+    ~AdvI2cBorrow() {
+        if (!borrowed) return;
+        Wire1.end();
+        pinMode(TCA8418_SCL_PIN, OUTPUT); // NRF24 CSN
+        digitalWrite(TCA8418_SCL_PIN, HIGH);
+        pinMode(TCA8418_SDA_PIN, OUTPUT); // NRF24 CE
+        digitalWrite(TCA8418_SDA_PIN, ceLevel ? HIGH : LOW);
+        if (spiLocked) NRFSPI->endTransaction();
+    }
+
+private:
+    bool borrowed = false;
+    bool spiLocked = false;
+    uint32_t ceLevel = 0;
+};
+#endif
+
 char getKeyChar(uint8_t row, uint8_t col) {
     char keyVal;
     if (shift_key_pressed ^ caps_lock) {
@@ -129,6 +179,44 @@ void _post_setup_gpio() {
     bruceConfigPins.sys_i2c.sda = (gpio_num_t)8;
     bruceConfigPins.sys_i2c.scl = (gpio_num_t)9;
 
+#ifdef CARDPUTER_ADV_3IN1
+    // 3-in-1 module pinout (sticker): shared SPI SCK40 / MISO39 / MOSI14
+    //   CC1101: CS 15, GDO0 13 | NRF24: CS 9, CE 8 | LoRa: CS 5, RST 3, DIO1 4, BUSY 6 | SD: CS 12
+    // G15/G13 are used by CC1101, so GPS goes to Grove
+    bruceConfigPins.gps_bus.rx = (gpio_num_t)GROVE_SCL;
+    bruceConfigPins.gps_bus.tx = (gpio_num_t)GROVE_SDA;
+
+    bruceConfigPins.CC1101_bus.sck = (gpio_num_t)40;
+    bruceConfigPins.CC1101_bus.miso = (gpio_num_t)39;
+    bruceConfigPins.CC1101_bus.mosi = (gpio_num_t)14;
+    bruceConfigPins.CC1101_bus.cs = (gpio_num_t)15;
+    bruceConfigPins.CC1101_bus.io0 = (gpio_num_t)13;
+    bruceConfigPins.rfModule = CC1101_SPI_MODULE;
+
+    bruceConfigPins.NRF24_bus.sck = (gpio_num_t)40;
+    bruceConfigPins.NRF24_bus.miso = (gpio_num_t)39;
+    bruceConfigPins.NRF24_bus.mosi = (gpio_num_t)14;
+    bruceConfigPins.NRF24_bus.cs = (gpio_num_t)9;
+    bruceConfigPins.NRF24_bus.io0 = (gpio_num_t)8;
+
+    bruceConfigPins.LoRa_bus.sck = (gpio_num_t)40;
+    bruceConfigPins.LoRa_bus.miso = (gpio_num_t)39;
+    bruceConfigPins.LoRa_bus.mosi = (gpio_num_t)14;
+    bruceConfigPins.LoRa_bus.cs = (gpio_num_t)5;
+    bruceConfigPins.LoRa_bus.io0 = (gpio_num_t)3;
+    bruceConfigPins.LoRa_bus.io2 = (gpio_num_t)4;
+
+    // IR: G5/G6 belong to LoRa now
+    if (bruceConfigPins.irTx == 5 || bruceConfigPins.irTx == 6) bruceConfigPins.irTx = TXLED;
+    if (bruceConfigPins.irRx == 5 || bruceConfigPins.irRx == 6) bruceConfigPins.irRx = GROVE_SCL;
+
+    // Deselect CC1101 and LoRa. NRF24 CSN (G9) is the I2C SCL line: it idles HIGH,
+    // so NRF24 is already deselected. Do NOT pinMode() it here, that would kill Wire1.
+    pinMode(bruceConfigPins.CC1101_bus.cs, OUTPUT);
+    pinMode(bruceConfigPins.LoRa_bus.cs, OUTPUT);
+    digitalWrite(bruceConfigPins.CC1101_bus.cs, HIGH);
+    digitalWrite(bruceConfigPins.LoRa_bus.cs, HIGH);
+#else
     bruceConfigPins.gps_bus.rx = (gpio_num_t)15;
     bruceConfigPins.gps_bus.tx = (gpio_num_t)13;
     bruceConfigPins.gpsBaudrate = 115200;
@@ -151,6 +239,7 @@ void _post_setup_gpio() {
     digitalWrite(bruceConfigPins.NRF24_bus.cs, HIGH);
     digitalWrite(bruceConfigPins.CC1101_bus.cs, HIGH);
     digitalWrite(bruceConfigPins.LoRa_bus.cs, HIGH);
+#endif
 
     tca.matrix(7, 8);
     tca.flush();
@@ -220,6 +309,9 @@ void InputHandler(void) {
         keyStroke key;
 
         if (kb_interrupt || digitalRead(11) == LOW) {
+#ifdef CARDPUTER_ADV_3IN1
+            AdvI2cBorrow i2cBorrow; // gives G8/G9 back to Wire1 for this block if NRF24 holds them
+#endif
             if (!kb_interrupt && digitalRead(11) == LOW) {
                 detachInterrupt(digitalPinToInterrupt(11));
                 attachInterruptArg(digitalPinToInterrupt(11), gpio_isr_handler, nullptr, CHANGE);
@@ -503,6 +595,9 @@ void _setup_codec_speaker(bool enable) {
     };
     static constexpr const uint8_t disabled_bulk_data[] = {0};
 
+#ifdef CARDPUTER_ADV_3IN1
+    AdvI2cBorrow i2cBorrow;
+#endif
     i2c_bulk_write(&Wire1, ES8311_ADDR, enable ? enabled_bulk_data : disabled_bulk_data);
 }
 
@@ -540,5 +635,8 @@ void _setup_codec_mic(bool enable) {
         0
     };
 
+#ifdef CARDPUTER_ADV_3IN1
+    AdvI2cBorrow i2cBorrow;
+#endif
     i2c_bulk_write(&Wire1, ES8311_ADDR, enable ? enabled_bulk_data : disabled_bulk_data);
 }

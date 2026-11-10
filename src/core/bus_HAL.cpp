@@ -4,6 +4,9 @@
 #include "soc/soc_caps.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#ifdef CARDPUTER_ADV_3IN1
+#include <esp32-hal-periman.h>
+#endif
 
 // # define BUSHAL_DBG
 #ifdef BUSHAL_DBG
@@ -256,6 +259,11 @@ bool checkAndRecoverSysI2CBus() {
     int8_t sda = (int8_t)bruceConfigPins.sys_i2c.sda;
     int8_t scl = (int8_t)bruceConfigPins.sys_i2c.scl;
     if (sda < 0 || scl < 0) return false; // board has no sys_i2c
+#ifdef CARDPUTER_ADV_3IN1
+    // G8/G9 are being used as NRF24 CE/CSN (plain GPIO): CE idles LOW, which would look like a
+    // stuck SDA and trigger a "recovery" that toggles NRF24 pins. Only watch while I2C owns them.
+    if (perimanGetPinBusType((uint8_t)scl) != ESP32_BUS_TYPE_I2C_MASTER_SCL) return false;
+#endif
 
     static unsigned long sdaLowSinceMs = 0;
     static unsigned long sclLowSinceMs = 0;
